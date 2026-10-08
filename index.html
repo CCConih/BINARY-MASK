@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Webcam Binary</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root { --bg: #000000; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000000; } }
+  :root[data-theme="dark"] { --bg: #000000; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); touch-action: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #face { filter: drop-shadow(0 0 14px rgba(0,255,255,.25)) drop-shadow(0 0 40px rgba(0,0,254,.35)); }
+  video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  /* shown only if there is no camera: a single blinking cursor */
+  .cursor {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    font: 700 clamp(2rem, 6vw, 4rem) 'JetBrains Mono', ui-monospace, monospace;
+    color: #00ffff; text-shadow: 0 0 18px rgba(0,255,255,.7);
+    display: none; animation: blink 1s steps(1) infinite;
+  }
+  .cursor.on { display: block; }
+  @keyframes blink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+</style>
+</head>
+<body>
+  <canvas id="rain" aria-hidden="true"></canvas>
+  <canvas id="face" role="img" aria-label="Your face, rebuilt from falling code"></canvas>
+  <video playsinline muted autoplay></video>
+  <div class="cursor" id="cursor" aria-hidden="true">_</div>
+
+<script>
+(() => {
+  // ================= SETTINGS =================
+  const CHARS = '01';          // characters everything is built from, e.g. '171026'
+  const FACE_ONLY = true;      // true = track the face, frame it and fade out the background
+  const DETAIL = 70;           // characters across the short side of the screen (higher = finer)
+  const MIRROR = true;         // selfie-style mirroring
+  // ============================================
+
+  const MP_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+  const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+  const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+
+  const rainCv = document.getElementById('rain'), rctx = rainCv.getContext('2d');
+  const faceCv = document.getElementById('face'), fctx = faceCv.getContext('2d');
+  const video = document.querySelector('video');
+  const sample = document.createElement('canvas'), sctx = sample.getContext('2d', { willReadFrequently: true });
+  const maskCv = document.createElement('canvas'), mctx = maskCv.getContext('2d');
+
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const ch = () => CHARS[(Math.random() * CHARS.length) | 0];
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const smooth = (t) => { t = clamp01(t); return t * t * (3 - 2 * t); };
+
+  // ---------- palette ----------
+  const PALETTE = [
+    { c: '#0000fe', h: '#9a9aff', w: 40 }, { c: '#00ffff', h: '#d6ffff', w: 28 },
+    { c: '#3b00d8', h: '#b9a0ff', w: 18 }, { c: '#00ffe3', h: '#ccfff8', w: 8 },
+    { c: '#ff1430', h: '#ffa3ad', w: 4 },  { c: '#ffffff', h: '#ffffff', w: 2 },
+  ];
+  const TOTAL_W = PALETTE.reduce((a, p) => a + p.w, 0);
+  const pickColor = () => { let r = Math.random() * TOTAL_W; for (const p of PALETTE) if ((r -= p.w) < 0) return p; return PALETTE[0]; };
+  const STOPS = [[0, [59, 0, 216]], [0.3, [0, 0, 254]], [0.65, [0, 255, 255]], [1, [230, 255, 255]]];
+  const RAMP = Array.from({ length: 64 }, (_, i) => {
+    const t = i / 63; let k = 0;
+    while (k < STOPS.length - 2 && t > STOPS[k + 1][0]) k++;
+    const [t0, c0] = STOPS[k], [t1, c1] = STOPS[k + 1], u = (t - t0) / (t1 - t0);
+    const c = c0.map((v, j) => Math.round(v + (c1[j] - v) * u));
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+  });
+  const rampColor = (l) => RAMP[Math.max(0, Math.min(63, Math.round(l * 63)))];
+
+  // ---------- layout ----------
+  let W = 0, H = 0, dpr = 1, rFont = 16, rCols = 0, rDrops = [], rSpeeds = [], rColors = [];
+  let cell = 10, cols = 0, rows = 0, lum = new Float32Array(0), drops = [], speeds = [];
+  function layout() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    for (const cv of [rainCv, faceCv]) { cv.width = Math.floor(W * dpr); cv.height = Math.floor(H * dpr); }
+    rctx.setTransform(dpr, 0, 0, dpr, 0, 0); fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    rFont = W < 600 ? 13 : 16;
+    rCols = Math.ceil(W / rFont);
+    rDrops = Array.from({ length: rCols }, () => Math.random() * -H / rFont);
+    rSpeeds = Array.from({ length: rCols }, () => rand(0.5, 1.1));
+    rColors = Array.from({ length: rCols }, pickColor);
+    rctx.fillStyle = '#000'; rctx.fillRect(0, 0, W, H);
+    cell = Math.max(7, Math.round(Math.min(W, H) / DETAIL));
+    cols = Math.ceil(W / cell); rows = Math.ceil(H / cell);
+    sample.width = cols; sample.height = rows;
+    lum = new Float32Array(cols * rows);
+    drops = Array.from({ length: cols }, () => rand(-rows, rows));
+    speeds = Array.from({ length: cols }, () => rand(0.35, 0.9));
+    if (video.videoWidth) Object.assign(crop, fullCover());
+  }
+
+  function tear(ctx, cv, maxShift) {
+    const y = rand(0, H), bh = rand(3, 30), dx = rand(-maxShift, maxShift);
+    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(cv, 0, y * dpr, cv.width, bh * dpr, dx * dpr, y * dpr, cv.width, bh * dpr);
+    ctx.restore();
+  }
+
+  // ---------- background rain ----------
+  function stepRain(bursting) {
+    rctx.fillStyle = 'rgba(0, 0, 6, 0.09)'; rctx.fillRect(0, 0, W, H);
+    rctx.font = `700 ${rFont}px 'JetBrains Mono', ui-monospace, monospace`;
+    rctx.textBaseline = 'top'; rctx.globalAlpha = camOn ? 0.35 : 0.6;
+    for (let i = 0; i < rCols; i++) {
+      const x = i * rFont, y = Math.floor(rDrops[i]) * rFont, col = rColors[i];
+      rctx.fillStyle = col.c; rctx.fillText(ch(), x, y - rFont);
+      rctx.fillStyle = col.h; rctx.fillText(ch(), x, y);
+      rDrops[i] += rSpeeds[i];
+      if (y > H && Math.random() > 0.975) { rDrops[i] = Math.random() * -20; rSpeeds[i] = rand(0.5, 1.1); rColors[i] = pickColor(); }
+    }
+    rctx.globalAlpha = 1;
+    if (Math.random() < 0.06) tear(rctx, rainCv, 40);
+    if (bursting) for (let k = 0; k < 3; k++) tear(rctx, rainCv, 120);
+  }
+
+  // ---------- camera framing ----------
+  const crop = { x: 0, y: 0, w: 1, h: 1 }, cropTarget = { x: 0, y: 0, w: 1, h: 1 };
+  let face = null, faceSeen = 0;
+  function fullCover() {
+    const vw = video.videoWidth, vh = video.videoHeight, ar = cols / rows;
+    let w = vw, h = vw / ar;
+    if (h > vh) { h = vh; w = vh * ar; }
+    return { x: (vw - w) / 2, y: (vh - h) / 2, w, h };
+  }
+  function updateCropTarget() {
+    if (!face) { Object.assign(cropTarget, fullCover()); return; }
+    const vw = video.videoWidth, vh = video.videoHeight;
+    let minX = 1, maxX = 0, minY = 1, maxY = 0;
+    for (const i of FACE_OVAL) { const p = face[i]; minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y); }
+    const fh = (maxY - minY) * vh, cx = (minX + maxX) / 2 * vw, cy = (minY + maxY) / 2 * vh;
+    const ar = cols / rows, cover = fullCover();
+    let h = fh * 1.35, w = h * ar;   // face fills ~75% of the screen height
+    if (w > cover.w) { w = cover.w; h = w / ar; }
+    if (h > cover.h) { h = cover.h; w = h * ar; }
+    Object.assign(cropTarget, { x: Math.max(0, Math.min(vw - w, cx - w / 2)), y: Math.max(0, Math.min(vh - h, cy - h / 2)), w, h });
+  }
+  // normalized video point -> grid cell coords
+  function toGrid(p) {
+    const sx = (p.x * video.videoWidth - crop.x) / crop.w, sy = (p.y * video.videoHeight - crop.y) / crop.h;
+    return { x: (MIRROR ? 1 - sx : sx) * cols, y: sy * rows };
+  }
+
+  // ---------- camera -> brightness grid ----------
+  let mean = 0.5, spread = 0.2;
+  function readFrame() {
+    if (!video.videoWidth) return;
+    for (const k of ['x', 'y', 'w', 'h']) crop[k] += (cropTarget[k] - crop[k]) * 0.15;
+    sctx.save();
+    if (MIRROR) sctx.setTransform(-1, 0, 0, 1, cols, 0);
+    sctx.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, cols, rows);
+    sctx.restore();
+    if (FACE_ONLY && face && faceSeen > 0.05) {
+      maskCv.width = cols; maskCv.height = rows;
+      mctx.fillStyle = `rgba(0,0,0,${(1 - faceSeen).toFixed(2)})`;
+      mctx.fillRect(0, 0, cols, rows);
+      mctx.filter = `blur(${Math.max(1, cols / 60)}px)`;
+      mctx.beginPath();
+      FACE_OVAL.forEach((i, k) => { const g = toGrid(face[i]); k ? mctx.lineTo(g.x, g.y) : mctx.moveTo(g.x, g.y); });
+      mctx.closePath(); mctx.fillStyle = '#000'; mctx.fill(); mctx.filter = 'none';
+      sctx.save(); sctx.globalCompositeOperation = 'destination-in'; sctx.drawImage(maskCv, 0, 0); sctx.restore();
+    }
+    const d = sctx.getImageData(0, 0, cols, rows).data;
+    let sum = 0, sum2 = 0, n = 0;
+    for (let i = 0; i < lum.length; i++) {
+      const v = (0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]) / 255;
+      lum[i] = v;
+      if (d[i * 4 + 3] > 127) { sum += v; sum2 += v * v; n++; }
+    }
+    if (n > 20) {   // auto levels, smoothed so it doesn't flicker
+      const m = sum / n, s = Math.sqrt(Math.max(1e-4, sum2 / n - m * m));
+      mean += (m - mean) * 0.1; spread += (s - spread) * 0.1;
+    }
+    for (let i = 0; i < lum.length; i++) lum[i] = clamp01((lum[i] - mean) / (spread * 3.2) + 0.55) * (d[i * 4 + 3] / 255);
+  }
+
+  // ---------- draw the face in code ----------
+  function stepFace(t, bursting) {
+    const reveal = smooth((t - camStart) / 1800);
+    fctx.globalCompositeOperation = 'destination-out';
+    fctx.fillStyle = 'rgba(0,0,0,0.28)'; fctx.fillRect(0, 0, W, H);
+    fctx.globalCompositeOperation = 'source-over';
+    fctx.font = `700 ${cell}px 'JetBrains Mono', ui-monospace, monospace`;
+    fctx.textBaseline = 'top';
+    for (let c = 0; c < cols; c++) {
+      const r = Math.floor(drops[c]);
+      for (let k = 0; k < 3; k++) {
+        const rr = r - k; if (rr < 0 || rr >= rows) continue;
+        const l = lum[rr * cols + c]; if (l < 0.05) continue;
+        fctx.globalAlpha = Math.min(1, (l * 1.1 + (k === 0 ? 0.25 : 0)) * reveal);
+        fctx.fillStyle = rampColor(k === 0 ? Math.min(1, l + 0.35) : l);
+        fctx.fillText(ch(), c * cell, rr * cell);
+      }
+      drops[c] += speeds[c];
+      if (drops[c] > rows + 4) { drops[c] = rand(-12, 0); speeds[c] = rand(0.35, 0.9); }
+    }
+    const total = cols * rows, n = Math.floor(total * 0.33 * reveal);
+    for (let k = 0; k < n; k++) {
+      const i = (Math.random() * total) | 0, l = lum[i];
+      if (l < 0.08) continue;
+      let x = (i % cols) * cell;
+      if (bursting && Math.random() < 0.25) x += rand(-cell * 2, cell * 2);
+      fctx.globalAlpha = Math.min(1, Math.pow(l, 0.8) * 1.15 * reveal);
+      fctx.fillStyle = rampColor(Math.min(1, l * 1.1));
+      fctx.fillText(ch(), x, ((i / cols) | 0) * cell);
+    }
+    fctx.globalAlpha = 1;
+    if (Math.random() < 0.05) tear(fctx, faceCv, 18);
+    if (bursting) {
+      for (let k = 0; k < 3; k++) tear(fctx, faceCv, 50);
+      if (Math.random() < 0.5) {
+        fctx.save(); fctx.setTransform(1, 0, 0, 1, 0, 0);
+        fctx.globalCompositeOperation = 'lighter'; fctx.globalAlpha = 0.3;
+        fctx.drawImage(faceCv, rand(-6, 6) * dpr, 0); fctx.restore();
+      }
+    }
+  }
+
+  // ---------- face tracking (framing + face-only mask) ----------
+  let landmarker = null, lastDetect = -1;
+  async function loadTracker() {
+    try {
+      const vision = await import(`${MP_URL}/vision_bundle.mjs`);
+      const files = await vision.FilesetResolver.forVisionTasks(`${MP_URL}/wasm`);
+      const opts = (delegate) => ({ baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numFaces: 1 });
+      try { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('GPU')); }
+      catch (e) { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('CPU')); }
+    } catch (e) { landmarker = null; }   // no tracking: the full camera image is used
+  }
+  function track(t) {
+    if (!landmarker || video.readyState < 2 || video.currentTime === lastDetect) return;
+    lastDetect = video.currentTime;
+    let res = null;
+    try { res = landmarker.detectForVideo(video, t); } catch (e) { return; }
+    face = res && res.faceLandmarks && res.faceLandmarks[0] ? res.faceLandmarks[0] : null;
+    faceSeen += ((face ? 1 : 0) - faceSeen) * 0.12;
+    updateCropTarget();
+  }
+
+  // ---------- loop ----------
+  let camOn = false, camStart = 0, last = 0, burstFrames = 0, nextBurst = 2500;
+  function loop(now) {
+    if (camOn && FACE_ONLY) track(now);
+    if (now - last >= 1000 / 30) {
+      if (now >= nextBurst) { burstFrames = (rand(4, 9)) | 0; nextBurst = now + rand(2500, 5000); }
+      const bursting = burstFrames > 0 && !reduceMotion;
+      stepRain(bursting);
+      if (camOn) { readFrame(); stepFace(now, bursting); }
+      if (bursting) burstFrames--;
+      last = now;
+    }
+    requestAnimationFrame(loop);
+  }
+
+  // pause the camera work when the tab is hidden
+  document.addEventListener('visibilitychange', () => {
+    if (!video.srcObject) return;
+    if (document.hidden) video.pause(); else video.play().catch(() => {});
+  });
+
+  async function start() {
+    layout();
+    window.addEventListener('resize', layout);
+    requestAnimationFrame(loop);
+    const noCam = () => document.getElementById('cursor').classList.add('on');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return noCam();
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    } catch (e) { return noCam(); }
+    video.srcObject = stream;
+    try { await video.play(); } catch (e) {}
+    await new Promise((r) => (video.videoWidth ? r() : video.addEventListener('loadedmetadata', r, { once: true })));
+    Object.assign(crop, fullCover()); Object.assign(cropTarget, crop);
+    camStart = performance.now();
+    camOn = true;
+    if (FACE_ONLY) loadTracker();
+  }
+  start();
+})();
+</script>
+</body>
+</html>
